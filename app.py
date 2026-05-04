@@ -40,35 +40,6 @@ _TRANSFORM = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-
-# ==============================================================================
-# Grad-CAM handler  (identical to Cell 7 in heatmap_output.ipynb)
-# ==============================================================================
-class GradCAMHandler:
-    def __init__(self, model, target_layer):
-        self.model        = model
-        self.target_layer = target_layer
-        self.gradients    = None
-        self.activations  = None
-        target_layer.register_forward_hook(self._save_act)
-        target_layer.register_full_backward_hook(self._save_grad)
-
-    def _save_act(self, m, i, o):
-        self.activations = o
-
-    def _save_grad(self, m, gi, go):
-        self.gradients = go[0]
-
-    def generate_heatmap(self, input_tensor, class_idx):
-        self.model.zero_grad()
-        output = self.model(input_tensor)
-        output[0, class_idx].backward()
-        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-        cam     = torch.sum(weights * self.activations, dim=1).squeeze().detach().cpu().numpy()
-        cam     = np.maximum(cam, 0)
-        return cam / (cam.max() + 1e-8)
-
-
 # ==============================================================================
 # Cached model loader — runs exactly once per Streamlit session
 # ==============================================================================
@@ -90,21 +61,14 @@ def _load_models():
         "google/vit-base-patch16-224",
         num_labels=num_classes,
         ignore_mismatched_sizes=True,
+        output_attentions=True 
     )
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
     state_dict = checkpoint.get("state_dict", checkpoint)
     vit.load_state_dict(state_dict, strict=False)
     vit.to(DEVICE).eval()
 
-    # ── MobileNetV2 for Grad-CAM (heatmap) ────────────────────────────────────
-    cnn = models.mobilenet_v2(weights="IMAGENET1K_V1")
-    cnn.classifier[1] = nn.Linear(cnn.last_channel, num_classes)
-    cnn.to(DEVICE).eval()
-
-    # Attach Grad-CAM hooks to last feature block
-    grad_cam = GradCAMHandler(cnn, cnn.features[-1])
-
-    return vit, cnn, grad_cam, idx_to_class
+    return vit, idx_to_class
 
 
 # ==============================================================================
@@ -116,20 +80,31 @@ def _preprocess(image_path):
     tens = _TRANSFORM(pil).unsqueeze(0).to(DEVICE)
     return tens, np_
 
+def extract_vit_attention(outputs):
+    attentions = outputs.attentions[-1]
 
-# ==============================================================================
-# Heatmap overlay  (Cell 8)
-# ==============================================================================
-def _apply_overlay(original_np, heatmap_raw, alpha=0.5):
+    attn = torch.mean(attentions, dim=1)
+    cls_attn = attn[0, 0, 1:]
+
+    grid_size = int(cls_attn.shape[0] ** 0.5)
+    attn_map = cls_attn.reshape(grid_size, grid_size)
+
+    attn_map = (attn_map - attn_map.min()) / (attn_map.max() + 1e-8)
+
+    return attn_map.cpu().numpy()
+
+def apply_vit_overlay(original_np, attention_map, alpha=0.5):
     H, W = original_np.shape[:2]
-    heatmap_resized = cv2.resize(heatmap_raw, (W, H), interpolation=cv2.INTER_CUBIC)
-    heatmap_u8      = np.uint8(255 * heatmap_resized)
-    heatmap_color   = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
-    heatmap_color   = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
-    overlay         = cv2.addWeighted(original_np, 1 - alpha, heatmap_color, alpha, 0)
-    return overlay, heatmap_resized
 
+    heatmap = cv2.resize(attention_map, (W, H))
+    heatmap_u8 = np.uint8(255 * heatmap)
 
+    heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(original_np, 1 - alpha, heatmap_color, alpha, 0)
+
+    return overlay, heatmap
 # ==============================================================================
 # Region detection  (Cell 9 — 4-quadrant version from notebook)
 # ==============================================================================
@@ -148,43 +123,39 @@ def _get_region(heatmap_resized, is_healthy):
     return f"{dominant} lung"
 
 
-# ==============================================================================
-# Main inference  (Cell 10)
-# ==============================================================================
 def run_inference(image_path: str) -> dict:
-    vit, cnn, grad_cam, idx_to_class = _load_models()
+    vit, idx_to_class = _load_models()
 
     input_tensor, original_np = _preprocess(image_path)
 
-    # 1. ViT classification
     with torch.no_grad():
-        outputs  = vit(input_tensor)
-        probs    = F.softmax(outputs.logits, dim=1)
+        outputs = vit(input_tensor)
+        probs = F.softmax(outputs.logits, dim=1)
         conf, pred_idx = torch.max(probs, dim=1)
 
     pred_idx = pred_idx.item()
-    conf     = conf.item()
-    label    = idx_to_class.get(pred_idx, f"class_{pred_idx}")
-    is_tb    = (label.lower() == "tb")
+    conf = conf.item()
 
-    # 2. Grad-CAM heatmap (MobileNetV2)
-    heatmap_raw                  = grad_cam.generate_heatmap(input_tensor, pred_idx)
-    overlay, heatmap_resized     = _apply_overlay(original_np, heatmap_raw)
+    label = idx_to_class.get(pred_idx, f"class_{pred_idx}")
+    is_tb = pred_idx == 1
 
-    # 3. For healthy: show clean original; for TB: show overlay
+    # 🔥 ViT Attention
+    attention_map = extract_vit_attention(outputs)
+    overlay, resized_map = apply_vit_overlay(original_np, attention_map)
+
     if not is_tb:
         display_image = original_np
-        region        = "No abnormal region detected"
+        region = "No abnormal region detected"
     else:
         display_image = overlay
-        region        = _get_region(heatmap_resized, False)
+        region = _get_region(resized_map, False)
 
     return {
         "prediction": label,
         "confidence": conf,
-        "region":     region,
-        "heatmap":    display_image,   # overlay (TB) or clean original (Healthy)
-        "original":   original_np,
+        "region": region,
+        "heatmap": display_image,
+        "original": original_np,
     }
 
 
@@ -245,7 +216,7 @@ with st.sidebar:
     st.image(
         "https://upload.wikimedia.org/wikipedia/commons/thumb/1/11/Chest_Xray_PA_3-8-2010.png/266px-Chest_Xray_PA_3-8-2010.png",
         caption="Sample Chest X-Ray",
-        use_column_width=True,
+        use_container_width=True,
     )
     st.markdown("---")
     st.markdown("### 🫁 About")
@@ -310,13 +281,13 @@ if uploaded_file is not None:
 
     with col_orig:
         st.markdown("**Original X-Ray**")
-        st.image(original, use_column_width=True, clamp=True)
+        st.image(original, use_container_width=True, clamp=True)
 
     with col_heat:
         is_tb = prediction.lower() == "tb"
         panel_title = "**Grad-CAM Heatmap Overlay**" if is_tb else "**Original X-Ray (Healthy — No Overlay)**"
         st.markdown(panel_title)
-        st.image(heatmap, use_column_width=True, clamp=True)
+        st.image(heatmap, use_container_width=True, clamp=True)
 
     st.markdown("---")
 
@@ -361,6 +332,7 @@ if uploaded_file is not None:
             unsafe_allow_html=True,
         )
 
+    st.info("🧠 Heatmap shows where the Vision Transformer focused.")
     st.markdown("---")
 
     with st.expander("🤖 LLM-Based Explanation *(coming soon)*", expanded=False):
